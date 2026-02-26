@@ -12,30 +12,35 @@ from email.message import EmailMessage
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
+# -----------------------------
+# APP CONFIG
+# -----------------------------
 app = Flask(__name__)
-app.secret_key = "change_this_to_any_random_string"
+app.secret_key = os.environ.get("SECRET_KEY", "change_this_to_any_random_string")
 
-DB_NAME = "users.db"
+DB_NAME = os.environ.get("DB_NAME", "users.db")
+
 MAX_ATTEMPTS = 3
 LOCK_SECONDS = 5 * 60  # 5 minutes
 
-# Admin credentials (set env vars in production)
+# Admin (for normal /login + uploading)
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")  # change this
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")  # change this on Render!
 
+# Password reset tokens
 RESET_TOKEN_EXPIRE_SECONDS = 15 * 60  # 15 minutes
 
-# Email (Gmail SMTP)
+# Email (optional)
 MAIL_HOST = os.environ.get("MAIL_HOST", "smtp.gmail.com")
-MAIL_PORT = int(os.environ.get("MAIL_PORT", "465"))  # SSL port
+MAIL_PORT = int(os.environ.get("MAIL_PORT", "465"))
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME", "")
 MAIL_APP_PASSWORD = os.environ.get("MAIL_APP_PASSWORD", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", MAIL_USERNAME)
 
-# -------------------------
-# FILE STORAGE SETTINGS
-# -------------------------
-UPLOAD_FOLDER = "uploads"
+# -----------------------------
+# FILE STORAGE
+# -----------------------------
+UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "uploads")  # Render free: ephemeral
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 ALLOWED_EXTENSIONS = {
     "pdf", "doc", "docx", "txt",
@@ -48,6 +53,9 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 
 
+# -----------------------------
+# DB HELPERS
+# -----------------------------
 def db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -59,10 +67,11 @@ def sha256_hex(s: str) -> str:
 
 
 def init_db():
+    """Create tables + auto-create admin user if not exists."""
     with db() as conn:
         cur = conn.cursor()
 
-        # USERS
+        # USERS table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +83,7 @@ def init_db():
             )
         """)
 
-        # PASSWORD RESETS
+        # PASSWORD RESETS table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS password_resets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +96,7 @@ def init_db():
             )
         """)
 
-        # FILES (shared library)
+        # FILES table (shared library)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +108,7 @@ def init_db():
             )
         """)
 
-        # Auto-create admin user for normal /login (if missing)
+        # Ensure admin user exists (for /login and uploads)
         cur.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,))
         exists = cur.fetchone()
         if not exists:
@@ -111,27 +120,26 @@ def init_db():
         conn.commit()
 
 
+# -----------------------------
+# SECURITY + USER HELPERS
+# -----------------------------
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def send_reset_email(to_email: str, reset_link: str):
-    if not MAIL_USERNAME or not MAIL_APP_PASSWORD or not MAIL_FROM:
-        raise RuntimeError("Email not configured. Set MAIL_USERNAME and MAIL_APP_PASSWORD.")
+def login_required() -> bool:
+    return "user_id" in session
 
-    msg = EmailMessage()
-    msg["Subject"] = "Password Reset Link"
-    msg["From"] = MAIL_FROM
-    msg["To"] = to_email
-    msg.set_content(
-        "You requested a password reset.\n\n"
-        f"Reset your password (expires in 15 minutes):\n{reset_link}\n\n"
-        "If you did not request this, ignore this email."
-    )
 
-    with smtplib.SMTP_SSL(MAIL_HOST, MAIL_PORT) as smtp:
-        smtp.login(MAIL_USERNAME, MAIL_APP_PASSWORD)
-        smtp.send_message(msg)
+def require_login():
+    if not login_required():
+        return redirect(url_for("login"))
+    return None
+
+
+def require_admin():
+    if not session.get("is_admin"):
+        abort(403)
 
 
 def get_user(username: str):
@@ -179,6 +187,28 @@ def set_user_password(user_id: int, new_password: str):
         conn.commit()
 
 
+# -----------------------------
+# PASSWORD RESET (optional)
+# -----------------------------
+def send_reset_email(to_email: str, reset_link: str):
+    if not MAIL_USERNAME or not MAIL_APP_PASSWORD or not MAIL_FROM:
+        raise RuntimeError("Email not configured. Set MAIL_USERNAME and MAIL_APP_PASSWORD on Render.")
+
+    msg = EmailMessage()
+    msg["Subject"] = "Password Reset Link"
+    msg["From"] = MAIL_FROM
+    msg["To"] = to_email
+    msg.set_content(
+        "You requested a password reset.\n\n"
+        f"Reset your password (expires in 15 minutes):\n{reset_link}\n\n"
+        "If you did not request this, ignore this email."
+    )
+
+    with smtplib.SMTP_SSL(MAIL_HOST, MAIL_PORT) as smtp:
+        smtp.login(MAIL_USERNAME, MAIL_APP_PASSWORD)
+        smtp.send_message(msg)
+
+
 def create_password_reset(user_id: int) -> str:
     raw_token = secrets.token_urlsafe(32)
     token_hash = sha256_hex(raw_token)
@@ -213,19 +243,9 @@ def mark_reset_used(reset_id: int):
         conn.commit()
 
 
-def login_required():
-    return "user_id" in session
-
-
-def require_admin():
-    if not session.get("is_admin"):
-        abort(403)
-
-
-# -------------------------
+# -----------------------------
 # ROUTES
-# -------------------------
-
+# -----------------------------
 @app.route("/")
 def home():
     return redirect(url_for("login"))
@@ -238,9 +258,9 @@ def register():
         email = request.form.get("email", "").strip()
         password = request.form.get("password", "")
 
-        # prevent anyone from taking the admin username
+        # Reserve admin username (so students can't take it)
         if username.lower() == ADMIN_USERNAME.lower():
-            return render_template("register.html", error="This username is reserved.")
+            return render_template("register.html", error="This username is reserved. Choose another.")
 
         if len(username) < 3:
             return render_template("register.html", error="Username must be at least 3 characters.")
@@ -270,20 +290,20 @@ def login():
 
         now = int(time.time())
 
+        # Locked?
         if user["lock_until"] > now:
             remaining = user["lock_until"] - now
             return render_template("login.html", locked=True, remaining_seconds=remaining)
 
+        # Correct password?
         if check_password_hash(user["password_hash"], password):
             reset_user_security(user["id"])
             session["user_id"] = user["id"]
             session["username"] = user["username"]
-
-            # ✅ This is what makes upload show for admin
             session["is_admin"] = (user["username"].lower() == ADMIN_USERNAME.lower())
-
             return redirect(url_for("dashboard"))
 
+        # Wrong password -> reduce attempts
         attempts_left = user["attempts_left"] - 1
         if attempts_left <= 0:
             update_attempts_and_lock(user["id"], 0, now + LOCK_SECONDS)
@@ -295,6 +315,148 @@ def login():
     return render_template("login.html")
 
 
+@app.route("/dashboard")
+def dashboard():
+    redir = require_login()
+    if redir:
+        return redir
+    return render_template("dashboard.html", username=session.get("username"))
+
+
+@app.route("/profile")
+def profile():
+    redir = require_login()
+    if redir:
+        return redir
+
+    user = get_user_by_id(session["user_id"])
+    if not user:
+        session.clear()
+        return redirect(url_for("login"))
+
+    now = int(time.time())
+    locked = user["lock_until"] > now
+    remaining = (user["lock_until"] - now) if locked else 0
+
+    return render_template(
+        "profile.html",
+        username=user["username"],
+        attempts_left=user["attempts_left"],
+        locked=locked,
+        remaining=remaining,
+        is_admin=session.get("is_admin", False)
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# -----------------------------
+# FILES (Shared library)
+# Admin uploads only, students download only
+# -----------------------------
+@app.route("/files")
+def files():
+    redir = require_login()
+    if redir:
+        return redir
+
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM files ORDER BY uploaded_at DESC").fetchall()
+    return render_template("files.html", files=rows)
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    redir = require_login()
+    if redir:
+        return redir
+    if not session.get("is_admin"):
+        abort(403)
+
+    if "file" not in request.files:
+        flash("No file selected", "error")
+        return redirect(url_for("files"))
+
+    f = request.files["file"]
+    if not f or f.filename == "":
+        flash("No file selected", "error")
+        return redirect(url_for("files"))
+
+    if not allowed_file(f.filename):
+        flash("File type not allowed", "error")
+        return redirect(url_for("files"))
+
+    original = secure_filename(f.filename)
+    ext = original.rsplit(".", 1)[1].lower()
+    stored = f"admin_{int(time.time())}_{os.urandom(6).hex()}.{ext}"
+
+    save_path = os.path.join(app.config["UPLOAD_FOLDER"], stored)
+    f.save(save_path)
+    size = os.path.getsize(save_path)
+
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO files (username, original_name, stored_name, size, uploaded_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session["username"], original, stored, size, int(time.time())))
+        conn.commit()
+
+    flash("Uploaded successfully ✅", "success")
+    return redirect(url_for("files"))
+
+
+@app.route("/download/<int:file_id>")
+def download(file_id):
+    redir = require_login()
+    if redir:
+        return redir
+
+    with db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+
+    if not row:
+        abort(404)
+
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        row["stored_name"],
+        as_attachment=True,
+        download_name=row["original_name"]
+    )
+
+
+@app.route("/delete/<int:file_id>", methods=["POST"])
+def delete(file_id):
+    redir = require_login()
+    if redir:
+        return redir
+    if not session.get("is_admin"):
+        abort(403)
+
+    with db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        if not row:
+            abort(404)
+
+        conn.execute("DELETE FROM files WHERE id=?", (file_id,))
+        conn.commit()
+
+    path = os.path.join(app.config["UPLOAD_FOLDER"], row["stored_name"])
+    if os.path.exists(path):
+        os.remove(path)
+
+    flash("Deleted ✅", "success")
+    return redirect(url_for("files"))
+
+
+# -----------------------------
+# OPTIONAL: Forgot / Reset routes
+# (Only if your templates exist: forgot.html, reset.html)
+# -----------------------------
 @app.route("/forgot", methods=["GET", "POST"])
 def forgot_password():
     if request.method == "POST":
@@ -337,216 +499,5 @@ def reset_password(token):
     return render_template("reset.html", invalid=False)
 
 
-@app.route("/dashboard")
-def dashboard():
-    if not login_required():
-        return redirect(url_for("login"))
-    return render_template("dashboard.html", username=session.get("username"))
-
-
-@app.route("/profile")
-def profile():
-    if not login_required():
-        return redirect(url_for("login"))
-
-    user = get_user_by_id(session["user_id"])
-    if not user:
-        session.clear()
-        return redirect(url_for("login"))
-
-    now = int(time.time())
-    locked = user["lock_until"] > now
-    remaining = user["lock_until"] - now if locked else 0
-
-    return render_template(
-        "profile.html",
-        username=user["username"],
-        attempts_left=user["attempts_left"],
-        locked=locked,
-        remaining=remaining,
-        is_admin=session.get("is_admin", False)
-    )
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-# -------------------------
-# COURSE FILES (ADMIN UPLOAD ONLY)
-# -------------------------
-
-@app.route("/files")
-def files():
-    if not login_required():
-        return redirect(url_for("login"))
-
-    with db() as conn:
-        rows = conn.execute("SELECT * FROM files ORDER BY uploaded_at DESC").fetchall()
-    return render_template("files.html", files=rows)
-
-
-@app.route("/upload", methods=["POST"])
-def upload():
-    if not login_required():
-        return redirect(url_for("login"))
-
-    if not session.get("is_admin"):
-        abort(403)
-
-    if "file" not in request.files:
-        flash("No file selected", "error")
-        return redirect(url_for("files"))
-
-    f = request.files["file"]
-    if not f or f.filename == "":
-        flash("No file selected", "error")
-        return redirect(url_for("files"))
-
-    if not allowed_file(f.filename):
-        flash("File type not allowed", "error")
-        return redirect(url_for("files"))
-
-    original = secure_filename(f.filename)
-    ext = original.rsplit(".", 1)[1].lower()
-    stored = f"admin_{int(time.time())}_{os.urandom(6).hex()}.{ext}"
-
-    save_path = os.path.join(app.config["UPLOAD_FOLDER"], stored)
-    f.save(save_path)
-    size = os.path.getsize(save_path)
-
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO files (username, original_name, stored_name, size, uploaded_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (session["username"], original, stored, size, int(time.time())))
-        conn.commit()
-
-    flash("Uploaded successfully ✅", "success")
-    return redirect(url_for("files"))
-
-
-@app.route("/download/<int:file_id>")
-def download(file_id):
-    if not login_required():
-        return redirect(url_for("login"))
-
-    with db() as conn:
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-
-    if not row:
-        abort(404)
-
-    return send_from_directory(
-        app.config["UPLOAD_FOLDER"],
-        row["stored_name"],
-        as_attachment=True,
-        download_name=row["original_name"]
-    )
-
-
-@app.route("/delete/<int:file_id>", methods=["POST"])
-def delete(file_id):
-    if not login_required():
-        return redirect(url_for("login"))
-
-    if not session.get("is_admin"):
-        abort(403)
-
-    with db() as conn:
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-        if not row:
-            abort(404)
-
-        conn.execute("DELETE FROM files WHERE id=?", (file_id,))
-        conn.commit()
-
-    path = os.path.join(app.config["UPLOAD_FOLDER"], row["stored_name"])
-    if os.path.exists(path):
-        os.remove(path)
-
-    flash("Deleted ✅", "success")
-    return redirect(url_for("files"))
-
-
-# -------------------------
-# ADMIN PANEL (your existing admin panel login)
-# -------------------------
-
-def get_all_users():
-    with db() as conn:
-        return conn.execute(
-            "SELECT id, username, attempts_left, lock_until FROM users ORDER BY id DESC"
-        ).fetchall()
-
-
-def delete_user_by_id(user_id: int):
-    with db() as conn:
-        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        conn.commit()
-
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-
-        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-            session["is_admin"] = True
-            session["admin_username"] = username
-            return redirect(url_for("admin_panel"))
-
-        return render_template("admin_login.html", error="Invalid admin credentials ❌")
-
-    return render_template("admin_login.html")
-
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("is_admin", None)
-    session.pop("admin_username", None)
-    return redirect(url_for("admin_login"))
-
-
-@app.route("/admin")
-def admin_panel():
-    require_admin()
-    users = get_all_users()
-    now = int(time.time())
-
-    users_view = []
-    for u in users:
-        remaining = (u["lock_until"] - now) if (u["lock_until"] and u["lock_until"] > now) else 0
-        users_view.append({
-            "id": u["id"],
-            "username": u["username"],
-            "attempts_left": u["attempts_left"],
-            "lock_until": u["lock_until"],
-            "remaining": remaining
-        })
-
-    return render_template("admin.html", users=users_view, admin=session.get("admin_username"))
-
-
-@app.route("/admin/reset/<int:user_id>", methods=["POST"])
-def admin_reset_user(user_id):
-    require_admin()
-    reset_user_security(user_id)
-    return redirect(url_for("admin_panel"))
-
-
-@app.route("/admin/delete/<int:user_id>", methods=["POST"])
-def admin_delete_user(user_id):
-    require_admin()
-    if session.get("user_id") == user_id:
-        session.clear()
-    delete_user_by_id(user_id)
-    return redirect(url_for("admin_panel"))
-
-
-if __name__ == "__main__":
-    init_db()
-    app.run(debug=True)
+# Initialize DB when app starts (important for Render)
+init_db()
